@@ -12,6 +12,8 @@ import {
   buildClaimTimeoutTx,
   normalizeInputBox,
   DEFAULT_DEV_PK,
+  BATTLESHIPS_TREE_HASH_HEX,
+  LOBBY_SCRIPT,
 } from '../src/lib/blockchain/fleet';
 import { generateBoardCommitment, generateMerkleProof, hashBlake2b256 } from '../src/lib/crypto/merkle';
 import { reduceUnsignedTx } from '../src/lib/blockchain/reducer';
@@ -39,6 +41,15 @@ describe('Contracts & Fleet SDK Integration Tests', () => {
     expect(lobbyAddr.length).toBeGreaterThan(20);
     expect(typeof bsAddr).toBe('string');
     expect(bsAddr.length).toBeGreaterThan(20);
+  });
+
+  it('pins the game tree hash that the lobby contract hard-codes', () => {
+    // The lobby compares OUTPUTS(0).propositionBytes against a compile-time constant. If the game script is
+    // edited without updating BATTLESHIPS_TREE_HASH_HEX (and the literal inside LOBBY_SCRIPT), every accept
+    // transaction would fail on chain. This guards against that drift.
+    const compiledHash = bytesToHex(hashBlake2b256(hexToBytes(getBattleshipsErgoTree().toHex())));
+    expect(compiledHash).toBe(BATTLESHIPS_TREE_HASH_HEX);
+    expect(LOBBY_SCRIPT).toContain(`fromBase16("${BATTLESHIPS_TREE_HASH_HEX}")`);
   });
 
   it('builds a valid Create Lobby transaction with Fleet SDK', () => {

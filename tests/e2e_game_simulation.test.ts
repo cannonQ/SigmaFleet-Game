@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import wasm from 'ergo-lib-wasm-nodejs';
 import { ErgoAddress, SColl, SInt, SByte, SGroupElement, OutputBuilder, TransactionBuilder, type Box, type Amount } from '@fleet-sdk/core';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils.js';
-import { serializeBox } from '@fleet-sdk/serializer';
+import { serializeBox, parse } from '@fleet-sdk/serializer';
 import {
   generateBoardCommitment,
   generateMerkleProof,
@@ -88,6 +88,14 @@ function reduceAndSign(
   const wallet = wasm.Wallet.from_secrets(secrets);
 
   return wallet.sign_reduced_transaction(reducedTx);
+}
+
+/** Reads the on-chain deadline (R9[0]) of a game box, so tests follow the contract's real window. */
+function readTimeoutHeight(gameBox: any): number {
+  const r9 = gameBox.additionalRegisters?.R9;
+  const hex = typeof r9 === 'string' ? r9 : r9?.serializedValue;
+  const parsed = parse<number[]>(hex);
+  return Number(parsed[0]);
 }
 
 function signedOutputToBox(signedTx: any, outputIndex: number): any {
@@ -427,8 +435,8 @@ describe('Bulletproof End-to-End Game Lifecycle Simulation', () => {
     const gameBox = signedOutputToBox(signedAccept, 0);
 
     // Host abandons the game at Phase 0 without firing Turn 1.
-    // Advance simulated height past timeout (1862860 + 31 = 1862891)
-    const timeoutHeight = 1862860 + 30;
+    // The lobby grants the opening move max(timeoutBlocks, 360) + up to 14 blocks; read the real deadline.
+    const timeoutHeight = readTimeoutHeight(gameBox);
     const claimHeight = timeoutHeight + 5;
 
     const userUtxoTimeout = createMockUserUtxo(p2Addr.encode(), 2000000n, claimHeight);
@@ -864,7 +872,7 @@ describe('Bulletproof End-to-End Game Lifecycle Simulation', () => {
     currentGameBox = signedOutputToBox(signedTurn1, 0);
 
     // Game is now at Phase 1 (Challenger's turn). Challenger goes AFK / abandons.
-    const timeoutHeight = turn1Height + 30;
+    const timeoutHeight = readTimeoutHeight(currentGameBox);
     const claimHeight = timeoutHeight + 5;
 
     const userUtxoClaimTimeout = createMockUserUtxo(p1Addr.encode(), 2000000n, claimHeight);
@@ -1409,9 +1417,8 @@ describe('Bulletproof End-to-End Game Lifecycle Simulation', () => {
     const signedAccept = reduceAndSign(acceptTx, [lobbyBox, p2Utxo], p2Secret, currentHeight);
     const gameBox = signedOutputToBox(signedAccept, 0);
 
-    // Timeout is at height 1862860 + 30 = 1862890.
-    // P1 tries to play at height 1862895 (> timeoutHeight).
-    const expiredHeight = 1862860 + 35;
+    // P1 tries to play 5 blocks after the on-chain deadline (> timeoutHeight).
+    const expiredHeight = readTimeoutHeight(gameBox) + 5;
     const u1 = createMockUserUtxo(p1Addr.encode(), 2000000n, expiredHeight);
     const expiredTurnTx = buildPlayTurnTx({
       activePlayerAddress: p1Addr.encode(),
@@ -1468,9 +1475,8 @@ describe('Bulletproof End-to-End Game Lifecycle Simulation', () => {
     const signedAccept = reduceAndSign(acceptTx, [lobbyBox, p2Utxo], p2Secret, currentHeight);
     const gameBox = signedOutputToBox(signedAccept, 0);
 
-    // Timeout height is exactly 1862860 + 30 = 1862890.
-    // Contract requires strict HEIGHT > timeoutHeight. At 1862890, it must fail!
-    const exactTimeoutHeight = 1862860 + 30;
+    // Contract requires strict HEIGHT > timeoutHeight. At exactly timeoutHeight it must fail!
+    const exactTimeoutHeight = readTimeoutHeight(gameBox);
     const u2 = createMockUserUtxo(p2Addr.encode(), 2000000n, exactTimeoutHeight);
     const prematureTimeoutTx = buildClaimTimeoutTx({
       activePlayerAddress: p2Addr.encode(),

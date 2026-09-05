@@ -193,6 +193,17 @@ Attacked and rejected, with the line that stopped each (details in `tests/adv_pr
 
 Items 1 to 4 are one line each and do not change any commitment format. With 1 to 3 applied the EKB verifier estimated the game contract at 8.5 / 10.
 
+## Status after patching
+
+Patch-set items 1 to 4 are applied on this branch (commit "Harden game and lobby contracts against merge, timeout, and escrow-routing attacks"):
+
+- Both contracts require exactly one box of their own script per transaction (findings 1 and 7).
+- Action 2 defers the sweep by one window when the timed-out player is the recorded winner (finding 2).
+- Deadline windows are one-sided in both contracts, the lobby refuses offers older than 720 blocks, and the host's opening move gets `max(timeoutBlocks, 360)` blocks (findings 3 and 6).
+- The lobby compares the game script against a compile-time constant instead of `R8` (finding 5).
+
+New build: game ErgoTree 3432 bytes, lobby 549 bytes, game tree hash `8e92acff548e5f242726819cf206973db4935f0ccb4930032d57623c5302722e`. Both addresses change, so this is a redeploy; the mainnet addresses in `Deployment_Contracts.md` still describe the previous build. The exploit tests for the fixed findings now assert rejection and carry positive controls for the honest paths. Finding 4 (root binding) and items 6 and 7 are not applied.
+
 ## Corrections to the README "Known issues" section
 
 - "It is not exploitable for profit" is true in expectation but "the attack only ever loses money" is not. The one-cell variant wins outright in roughly one match in seven at equal skill and cannot be detected during play.
