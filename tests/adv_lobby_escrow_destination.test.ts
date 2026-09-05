@@ -1,24 +1,26 @@
 /**
- * Adversarial PoCs against lobby.es.
+ * Adversarial PoCs against lobby.es, re-pointed at the hardened contract.
  *
- * D. R8 SCRIPT SUBSTITUTION.  The lobby's "the escrow can only ever go to the battleships
- *    contract" guarantee is
+ * D. R8 SCRIPT SUBSTITUTION (FIXED).  The lobby's "the escrow can only ever go to the
+ *    battleships contract" guarantee used to be
  *        val battleshipsScript = SELF.R8[Coll[Byte]].get
  *        val validContract = blake2b256(outGame.propositionBytes) == battleshipsScript
  *    R8 is per-box data written by whoever created the lobby, i.e. the host, not a constant
- *    baked into the script. A host can therefore point the escrow anywhere. D1 shows the
- *    accept branch happily paying a 2 ERG "game box" to the host's own P2PK; D2 is the
- *    control with an honest R8 and the same output (rejected); D3 is the honest accept
- *    (accepted), proving the harness is not vacuous in either direction.
+ *    baked into the script, so a host could point the escrow anywhere. The hardening commit
+ *    stopped reading R8 and compares against a hard-coded BATTLESHIPS_HASH constant instead.
+ *    D1 is the original PoC transaction (a 2 ERG "game box" paid to the host's own P2PK) and
+ *    is now REJECTED; D2 is the same payout with an honest R8 (still rejected); D3 is the
+ *    honest accept (still accepted), proving the harness is not vacuous in either direction.
  *
- *    README.md states: "The lobby contract stores that tree hash in R8 and refuses to open a
- *    match whose output script does not match it - so a lobby can only ever hand its escrow
- *    to this exact contract." D1 falsifies that sentence.
+ *    Two further rules from the same commit are exercised implicitly here: the lobby input's
+ *    creationHeight must be within LOBBY_TTL_BLOCKS of HEIGHT, and the game box's opening
+ *    deadline must land in [HEIGHT + max(tb, FIRST_TURN_GRACE_BLOCKS), ... + 14].
  *
  * E. LOBBY + GAME MERGE (attack that FAILED, documented with the exact blocker).
  *    Every input under the same script sees only OUTPUTS(0), so an attacker holding a game
  *    box worth exactly 2V could try to absorb a victim's V lobby into it and take V as
- *    change (inputs 3V, OUTPUTS(0) 2V, change V). E1/E2 show both phase choices rejected.
+ *    change (inputs 3V, OUTPUTS(0) 2V, change V). E1/E2 show both phase choices rejected;
+ *    both contracts now also carry a singleInput rule that independently forbids this shape.
  */
 import { describe, it, expect } from 'vitest';
 import * as wasm from 'ergo-lib-wasm-nodejs';
@@ -31,6 +33,7 @@ import { generateBoardCommitment, hashBlake2b256 } from '../src/lib/crypto/merkl
 import {
   getBattleshipsErgoTree, getBattleshipsAddress, getLobbyErgoTree,
   normalizeInputBox, DEFAULT_DEV_PK,
+  FIRST_TURN_GRACE_BLOCKS, TIMEOUT_SLACK_BLOCKS,
 } from '../src/lib/blockchain/fleet';
 
 const DEV_PK = DEFAULT_DEV_PK;
@@ -39,6 +42,10 @@ const POT = WAGER * 2n;
 const TB = 30;
 const FEE = 1100000n;
 const H = 1250000;
+// tb = 30 is below the 360-block first-turn grace, so the lobby demands an opening deadline in
+// [HEIGHT + 360, HEIGHT + 374]. Every tx in this file is reduced at state height H.
+const OPENING = Math.max(TB, FIRST_TURN_GRACE_BLOCKS);
+const OPENING_DEADLINE = H + OPENING + TIMEOUT_SLACK_BLOCKS;
 
 function stateCtx(height: number) {
   const hs: any[] = [];
@@ -94,7 +101,8 @@ const EVIL_R8 = hashBlake2b256(hexToBytes(hostAddr.ergoTree)); // hash of the ho
 
 function lobbyBox(r8: Uint8Array, value = WAGER) {
   return withId({
-    value: value.toString(), ergoTree: getLobbyErgoTree().toHex(), assets: [], creationHeight: H - 5000,
+    // creationHeight must be within LOBBY_TTL_BLOCKS (720) of HEIGHT or the accept branch refuses outright.
+    value: value.toString(), ergoTree: getLobbyErgoTree().toHex(), assets: [], creationHeight: H - 100,
     additionalRegisters: {
       R4: SColl(SGroupElement, [hexToBytes(hostPk), hexToBytes(DEV_PK)]).toHex(),
       R5: SColl(SColl(SByte), [
@@ -109,9 +117,9 @@ function lobbyBox(r8: Uint8Array, value = WAGER) {
   });
 }
 
-// The register set the lobby's accept branch demands of OUTPUTS(0). Note that nothing in
-// lobby.es requires OUTPUTS(0) to be a *contract* box: only its script hash is compared,
-// and that comparison value comes from R8.
+// The register set the lobby's accept branch demands of OUTPUTS(0). The script-hash comparison
+// value is now a constant in the contract rather than R8, so the destination is no longer
+// host-controlled; the rest of the register shape is unchanged.
 const acceptRegisters = {
   R4: SColl(SGroupElement, [hexToBytes(hostPk), hexToBytes(chalPk), hexToBytes(DEV_PK)]).toHex(),
   R5: SColl(SColl(SByte), [
@@ -121,7 +129,7 @@ const acceptRegisters = {
   R6: SColl(SInt, [0, 0, 0]).toHex(),
   R7: SColl(SInt, []).toHex(),
   R8: SColl(SColl(SByte), [Array(64).fill(0), Array(64).fill(0)]).toHex(),
-  R9: SColl(SInt, [H + TB, TB]).toHex(),
+  R9: SColl(SInt, [OPENING_DEADLINE, TB]).toHex(),
 };
 
 function acceptTx(lobby: any, destination: string) {
@@ -136,13 +144,12 @@ function acceptTx(lobby: any, destination: string) {
   return { tx, inputs: [lobby, fund] };
 }
 
-describe('D. lobby escrow destination is host-controlled data (R8), not code', () => {
-  it('D1 EXPLOIT: a lobby whose R8 is the host P2PK hash pays the whole 2 ERG escrow to the host', () => {
+describe('D. lobby escrow destination is code, not host-controlled data (R8)', () => {
+  it('D1 REGRESSION: a lobby whose R8 is the host P2PK hash paying the whole 2 ERG escrow to the host is now rejected', () => {
+    // Unchanged PoC transaction: same evil R8, same P2PK destination. R8 is no longer read, so the
+    // hard-coded BATTLESHIPS_HASH comparison fails and the accept reduces to false.
     const { tx, inputs } = acceptTx(lobbyBox(EVIL_R8), hostAddr.encode());
-    const signed = reduceAndSign(tx, inputs, chalSecret, H);
-    const out0 = JSON.parse(signed.outputs().get(0).to_json());
-    expect(out0.ergoTree).toBe(hostAddr.ergoTree);            // plain P2PK, not the game contract
-    expect(BigInt(out0.value)).toBe(POT);                     // host stakes 1 ERG, walks with 2
+    expect(() => reduceAndSign(tx, inputs, chalSecret, H)).toThrow(/reduced to false/i);
   });
 
   it('D2 CONTROL: the same payout with the honest R8 in the lobby is rejected', () => {
