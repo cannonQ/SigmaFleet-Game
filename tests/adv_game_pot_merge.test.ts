@@ -1,23 +1,34 @@
 /**
- * F. ACTION 0 GAME-BOX MERGE -- outright pot theft.
+ * F. ACTION 0 GAME-BOX MERGE -- outright pot theft, now closed by Rule 0.
  *
- * Every input under the battleships script inspects only OUTPUTS(0), and the only value rule
- * in ACTION 0 is
+ * Before the hardening patch every input under the battleships script inspected only
+ * OUTPUTS(0), and the only value rule in ACTION 0 was
  *      val validOutput = (outGame.propositionBytes == SELF.propositionBytes) &&
  *                        (outGame.value == SELF.value) && validTokens
- * There is no "the sum of the inputs under this script equals OUTPUTS(0)". So n game boxes
- * that agree on R4, R5, R6, R8, R9(1) and value can all be spent in ONE ACTION 0 transaction
- * against a single OUTPUTS(0) worth one pot, and the other n-1 pots leave as change to
- * whoever built the transaction. Both boxes need the same active player, which is automatic
- * because R4 and the phase agree.
+ * There was no "the sum of the inputs under this script equals OUTPUTS(0)". So n game boxes
+ * that agree on R4, R5, R6, R8, R9(1) and value could all be spent in ONE ACTION 0
+ * transaction against a single OUTPUTS(0) worth one pot, and the other n-1 pots left as
+ * change to whoever built the transaction.
  *
- * F1  two fresh 2 ERG game boxes -> one 2 ERG game box + ~2 ERG change to P1.
- * F2  three boxes -> two whole pots stolen in a single transaction.
- * F3  the same trick mid-match, on P2's turn, with genuine Merkle proofs supplied separately
- *     per input and DIFFERENT in-flight salvos in R7 (per-input context extensions do not
- *     bind the boxes together).
+ * The patched contract adds
+ *      val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
+ * to ACTION 0, ACTION 1 and ACTION 2, so every merged transaction below now reduces to false.
+ * The transactions are byte-for-byte the attacks that used to succeed, with one unavoidable
+ * update: the hand-built output R9(0) moved into the new Rule 7 band
+ * [HEIGHT + timeoutBlocks, HEIGHT + timeoutBlocks + 14] so that the ONLY thing rejecting them
+ * is the merge guard, not a stale deadline. The single-box CONTROLs prove exactly that:
+ * the identical turn on one input still signs.
+ *
+ * F1  REGRESSION: two fresh 2 ERG game boxes -> rejected.
+ * F2  REGRESSION: three boxes -> rejected.
+ * F3  REGRESSION: the same trick mid-match, on P2's turn, with genuine Merkle proofs supplied
+ *     separately per input and DIFFERENT in-flight salvos in R7 -> rejected.
+ * F3b CONTROL: the same mid-match turn on ONE box signs.
  * F4  CONTROL: differing commitments in R5 -> rejected (outHashes == roots).
  * F5  CONTROL: differing pot values -> rejected (outGame.value == SELF.value).
+ * F6  CONTROL: a single fresh game box played alone under ACTION 0 signs.
+ * F7..F10 Rule 7 band regression: HEIGHT + tb - 1 and HEIGHT + tb + 15 are rejected,
+ *     HEIGHT + tb and HEIGHT + tb + 14 sign.
  */
 import { describe, it, expect } from 'vitest';
 import * as wasm from 'ergo-lib-wasm-nodejs';
@@ -36,6 +47,10 @@ const POT = 2000000000n;   // 2 ERG: two 1 ERG stakes
 const TB = 30;
 const FEE = 1100000n;
 const H = 1250000;
+// Rule 7 mempool tolerance: nextTimeoutHeight must land in [HEIGHT + TB, HEIGHT + TB + 14].
+// The state context below puts HEIGHT exactly at H, so H + TB + 14 is the top of the band
+// and the value the production builder (buildPlayTurnTx) writes.
+const SLACK = 14;
 
 function stateCtx(height: number) {
   const hs: any[] = [];
@@ -120,16 +135,18 @@ const fresh = (tag: string, extra: any = {}) => box({
 
 // P1's opening salvo; no incoming salvo means no Merkle proofs are needed.
 const OPENING = [10, 25, 42, 51, 60];
-function openingOutput(value = POT) {
+function openingOutput(value = POT, nextTimeoutHeight = H + TB + SLACK) {
   return new OutputBuilder(value, getBattleshipsAddress()).setAdditionalRegisters({
     R4, R5,
     R6: SColl(SInt, [1, 0, 0]).toHex(),
     R7: SColl(SInt, OPENING).toHex(),
     R8: SColl(SColl(SByte), [hist(OPENING), hist([])]).toHex(),
-    R9: SColl(SInt, [H + TB + 4, TB]).toHex(),
+    R9: SColl(SInt, [nextTimeoutHeight, TB]).toHex(),
   } as any);
 }
 
+// One transaction shape for every ACTION 0 case: n game boxes (n == 1 is the honest path,
+// n > 1 is the merge attack) plus one funding box, against a single game output.
 function mergeTx(boxes: any[], out: OutputBuilder) {
   const u = utxo(p1Addr.encode(), 20000000n, H - 30);
   const tx = new TransactionBuilder(H)
@@ -153,61 +170,77 @@ const changeTo = (signed: any, tree: string) => {
   return total;
 };
 
-describe('F. ACTION 0 collapses several game boxes into one and refunds the rest as change', () => {
-  it('F1 EXPLOIT: two identical 2 ERG game boxes -> one 2 ERG box and ~2 ERG change to the mover', () => {
+// ---------------------------------------------------------------------------
+// F3 shared fixture: a real mid-match turn on P2's side, with genuine Merkle proofs.
+// Identical shot histories, but the two matches reached them in a different salvo order,
+// so R7 differs. Both salvos are water on P2's board, so both answer with newHits == 0.
+// ---------------------------------------------------------------------------
+const F3_P1_FIRED = [0, 1, 2, 3, 4, 16, 17, 18, 19, 20];
+const F3_SALVO_A = [0, 1, 2, 3, 4];
+const F3_SALVO_B = [16, 17, 18, 19, 20];
+const F3_P2_FIRED = [56, 57, 58, 59, 60];
+const F3_NEXT_SALVO = [32, 33, 34, 35, 36];
+
+function midMatchBox(tag: string, pending: number[]) {
+  return box({
+    tag, pending, phase: 1, p1Hits: 0, p2Hits: 0,
+    p1History: hist(F3_P1_FIRED), p2History: hist(F3_P2_FIRED), timeoutHeight: H + 20,
+  });
+}
+function midMatchOutput() {
+  return new OutputBuilder(POT, getBattleshipsAddress()).setAdditionalRegisters({
+    R4, R5,
+    R6: SColl(SInt, [0, 0, 0]).toHex(),
+    R7: SColl(SInt, F3_NEXT_SALVO).toHex(),
+    R8: SColl(SColl(SByte), [hist(F3_P1_FIRED), hist([...F3_P2_FIRED, ...F3_NEXT_SALVO])]).toHex(),
+    R9: SColl(SInt, [H + TB + SLACK, TB]).toHex(),
+  } as any);
+}
+// Per-input context extension: action 0 plus one 224-byte Merkle proof per incoming target.
+const midMatchExt = (cells: number[]) => {
+  const e: Record<number, string> = { 0: SByte(0).toHex() };
+  cells.forEach((c, i) => {
+    e[i + 1] = SColl(SByte, Array.from(generateMerkleProof(c, com2.rawLeaves, com2.tree).proofBytes)).toHex();
+  });
+  return e;
+};
+function midMatchTx(entries: { box: any; salvo: number[] }[]) {
+  const u = utxo(p2Addr.encode(), 20000000n, H - 30);
+  const tx = new TransactionBuilder(H)
+    .from([
+      ...entries.map((e) => ({ ...normalizeInputBox(e.box as any), extension: midMatchExt(e.salvo) }) as any),
+      normalizeInputBox(u as any) as any,
+    ])
+    .configureSelector((sel: any) => sel.ensureInclusion(entries.map((e) => e.box.boxId)))
+    .to(midMatchOutput()).sendChangeTo(p2Addr.encode()).payFee(FEE).build();
+  return { tx, inputs: [...entries.map((e) => e.box), u] };
+}
+
+describe('F. ACTION 0 no longer collapses several game boxes into one', () => {
+  it('F1 REGRESSION: merging two identical 2 ERG game boxes is now rejected', () => {
     const { tx, inputs } = mergeTx([fresh('c1'), fresh('c2')], openingOutput());
-    const signed = reduceAndSign(tx, inputs, p1Secret, H);
-    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
-    expect(changeTo(signed, p1Addr.ergoTree)).toBeGreaterThan(POT - 30000000n); // a whole pot stolen
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
   });
 
-  it('F2 EXPLOIT: three identical game boxes -> two whole pots leave as change', () => {
+  it('F2 REGRESSION: merging three identical game boxes is now rejected', () => {
     const { tx, inputs } = mergeTx([fresh('c1'), fresh('c2'), fresh('c3')], openingOutput());
-    const signed = reduceAndSign(tx, inputs, p1Secret, H);
-    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
-    expect(changeTo(signed, p1Addr.ergoTree)).toBeGreaterThan(2n * POT - 30000000n);
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
   });
 
-  it('F3 EXPLOIT: mid-match on P2 turn, with real proofs and DIFFERENT in-flight salvos per input', () => {
-    // Identical shot histories, but the two matches reached them in a different salvo order,
-    // so R7 differs. Both salvos are water on P2's board, so both answer with newHits == 0.
-    const p1Fired = [0, 1, 2, 3, 4, 16, 17, 18, 19, 20];
-    const salvoA = [0, 1, 2, 3, 4];
-    const salvoB = [16, 17, 18, 19, 20];
-    const p2Fired = [56, 57, 58, 59, 60];
-    const common = {
-      phase: 1, p1Hits: 0, p2Hits: 0,
-      p1History: hist(p1Fired), p2History: hist(p2Fired), timeoutHeight: H + 20,
-    };
-    const bA = box({ tag: 'd1', pending: salvoA, ...common });
-    const bB = box({ tag: 'd2', pending: salvoB, ...common });
-    const nextSalvo = [32, 33, 34, 35, 36];
-    const out = new OutputBuilder(POT, getBattleshipsAddress()).setAdditionalRegisters({
-      R4, R5,
-      R6: SColl(SInt, [0, 0, 0]).toHex(),
-      R7: SColl(SInt, nextSalvo).toHex(),
-      R8: SColl(SColl(SByte), [hist(p1Fired), hist([...p2Fired, ...nextSalvo])]).toHex(),
-      R9: SColl(SInt, [H + TB + 4, TB]).toHex(),
-    } as any);
-    const ext = (cells: number[]) => {
-      const e: Record<number, string> = { 0: SByte(0).toHex() };
-      cells.forEach((c, i) => {
-        e[i + 1] = SColl(SByte, Array.from(generateMerkleProof(c, com2.rawLeaves, com2.tree).proofBytes)).toHex();
-      });
-      return e;
-    };
-    const u = utxo(p2Addr.encode(), 20000000n, H - 30);
-    const tx = new TransactionBuilder(H)
-      .from([
-        { ...normalizeInputBox(bA as any), extension: ext(salvoA) } as any,
-        { ...normalizeInputBox(bB as any), extension: ext(salvoB) } as any,
-        normalizeInputBox(u as any) as any,
-      ])
-      .configureSelector((sel: any) => sel.ensureInclusion([bA.boxId, bB.boxId]))
-      .to(out).sendChangeTo(p2Addr.encode()).payFee(FEE).build();
-    const signed = reduceAndSign(tx, [bA, bB, u], p2Secret, H);
+  it('F3 REGRESSION: the mid-match merge on P2 turn, with real proofs and DIFFERENT in-flight salvos per input, is now rejected', () => {
+    const { tx, inputs } = midMatchTx([
+      { box: midMatchBox('d1', F3_SALVO_A), salvo: F3_SALVO_A },
+      { box: midMatchBox('d2', F3_SALVO_B), salvo: F3_SALVO_B },
+    ]);
+    expect(() => reduceAndSign(tx, inputs, p2Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('F3b CONTROL: the same mid-match turn on ONE box signs', () => {
+    const { tx, inputs } = midMatchTx([{ box: midMatchBox('d1', F3_SALVO_A), salvo: F3_SALVO_A }]);
+    const signed = reduceAndSign(tx, inputs, p2Secret, H);
     expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
-    expect(changeTo(signed, p2Addr.ergoTree)).toBeGreaterThan(POT - 30000000n);
+    // Only the funding box is left over, never a whole pot.
+    expect(changeTo(signed, p2Addr.ergoTree)).toBeLessThan(20000000n);
   });
 
   it('F4 CONTROL: two boxes with different R5 commitments are rejected', () => {
@@ -219,20 +252,59 @@ describe('F. ACTION 0 collapses several game boxes into one and refunds the rest
     const { tx, inputs } = mergeTx([fresh('c1'), fresh('c2', { value: POT + 1000000n })], openingOutput());
     expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
   });
+
+  it('F6 CONTROL: a single fresh game box played alone under ACTION 0 signs', () => {
+    const { tx, inputs } = mergeTx([fresh('c1')], openingOutput());
+    const signed = reduceAndSign(tx, inputs, p1Secret, H);
+    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
+    expect(changeTo(signed, p1Addr.ergoTree)).toBeLessThan(20000000n); // funding change only
+  });
 });
 
 /**
- * G. The same missing "one box in, one box out" invariant in ACTION 1.
+ * Rule 7 band regression. The old window was [HEIGHT + tb - 10, HEIGHT + tb + 4], which let a
+ * mover hand the opponent a deadline up to ten blocks EARLIER than nominal. The patched window
+ * is [HEIGHT + tb, HEIGHT + tb + 14]: never early, and up to 14 blocks of mempool slack late.
+ * HEIGHT is exactly H under the state context built above.
+ */
+describe('F7-F10. ACTION 0 next-deadline band is [HEIGHT + tb, HEIGHT + tb + 14]', () => {
+  const play = (nextTimeoutHeight: number) => mergeTx([fresh('c1')], openingOutput(POT, nextTimeoutHeight));
+
+  it('F7 REGRESSION: a single-box turn setting nextTimeoutHeight = HEIGHT + tb - 1 is rejected', () => {
+    const { tx, inputs } = play(H + TB - 1);
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('F8 REGRESSION: a single-box turn setting nextTimeoutHeight = HEIGHT + tb + 15 is rejected', () => {
+    const { tx, inputs } = play(H + TB + 15);
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('F9 CONTROL: nextTimeoutHeight = HEIGHT + tb (bottom of the band) signs', () => {
+    const { tx, inputs } = play(H + TB);
+    const signed = reduceAndSign(tx, inputs, p1Secret, H);
+    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
+  });
+
+  it('F10 CONTROL: nextTimeoutHeight = HEIGHT + tb + 14 (top of the band, what buildPlayTurnTx writes) signs', () => {
+    const { tx, inputs } = play(H + TB + SLACK);
+    const signed = reduceAndSign(tx, inputs, p1Secret, H);
+    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
+  });
+});
+
+/**
+ * G. The same missing "one box in, one box out" invariant in ACTION 1, also closed by Rule 0.
  *
  * getVar(99) is a PER-INPUT context extension, so two settlements with completely different
- * board commitments can share one transaction. validPayout only says
+ * board commitments used to share one transaction. validPayout only says
  *      OUTPUTS(0).value >= winPayout  &&  OUTPUTS(1).value >= devFeeNano
- * per box, so n concluded matches settle against ONE dev-fee output: the protocol is paid
- * once instead of n times, and the surplus lands in the claimant's change. Unlike F this is
- * not pot theft -- the claimant has to be the rightful winner of every box it merges -- it is
- * a protocol-fee leak, and it shows the same invariant is missing in the settlement branch.
+ * per box, so n concluded matches settled against ONE dev-fee output: the protocol was paid
+ * once instead of n times, and the surplus landed in the claimant's change. Unlike F this was
+ * not pot theft -- the claimant had to be the rightful winner of every box it merged -- it was
+ * a protocol-fee leak. singleInput now rejects the batch, while a lone settlement still signs.
  */
-describe('G. ACTION 1 settles several matches against a single dev-fee output', () => {
+describe('G. ACTION 1 no longer settles several matches against a single dev-fee output', () => {
   const comY = generateBoardCommitment(g1, '44'.repeat(32)); // P1's board, different salt
   const p2Fired = [56, 57, 58, 59, 60];                      // all water on P1's board
   const settleBox = (tag: string, r5: string) => withId({
@@ -247,43 +319,60 @@ describe('G. ACTION 1 settles several matches against a single dev-fee output', 
     transactionId: tag.repeat(32), index: 0,
   });
 
-  function settleTx(devValue: bigint) {
-    const bA = settleBox('e1', mkR5(com1, com2));
-    const bB = settleBox('e2', mkR5(comY, com2));
+  const ext = (payload: Uint8Array) => ({
+    0: SByte(1).toHex(),
+    99: SColl(SByte, Array.from(payload)).toHex(),
+  });
+
+  // entries: the concluded matches being settled. One entry is the honest path; two is the batch.
+  function settleTx(devValue: bigint, entries: { box: any; payload: Uint8Array }[]) {
     const u = utxo(p1Addr.encode(), 20000000n, H - 30);
     const win = new OutputBuilder(POT - POT / 100n, p1Addr.encode());
     const dev = new OutputBuilder(devValue, ErgoAddress.fromPublicKey(DEV_PK).encode());
-    const ext = (payload: Uint8Array) => ({
-      0: SByte(1).toHex(),
-      99: SColl(SByte, Array.from(payload)).toHex(),
-    });
     const tx = new TransactionBuilder(H)
       .from([
-        { ...normalizeInputBox(bA as any), extension: ext(com1.saltedBoardPayload) } as any,
-        { ...normalizeInputBox(bB as any), extension: ext(comY.saltedBoardPayload) } as any,
+        ...entries.map((e) => ({ ...normalizeInputBox(e.box as any), extension: ext(e.payload) }) as any),
         normalizeInputBox(u as any) as any,
       ])
-      .configureSelector((sel: any) => sel.ensureInclusion([bA.boxId, bB.boxId]))
+      .configureSelector((sel: any) => sel.ensureInclusion(entries.map((e) => e.box.boxId)))
       .to([win, dev]).sendChangeTo(p1Addr.encode()).payFee(FEE).build();
-    return { tx, inputs: [bA, bB, u] };
+    return { tx, inputs: [...entries.map((e) => e.box), u] };
   }
 
-  it('G1 EXPLOIT: two 2 ERG matches settle paying the protocol a single 0.02 ERG fee', () => {
-    const { tx, inputs } = settleTx(POT / 100n);
-    const signed = reduceAndSign(tx, inputs, p1Secret, H);
+  const batch = (devValue: bigint) => settleTx(devValue, [
+    { box: settleBox('e1', mkR5(com1, com2)), payload: com1.saltedBoardPayload },
+    { box: settleBox('e2', mkR5(comY, com2)), payload: comY.saltedBoardPayload },
+  ]);
+  const single = (devValue: bigint) => settleTx(devValue, [
+    { box: settleBox('e1', mkR5(com1, com2)), payload: com1.saltedBoardPayload },
+  ]);
+
+  const devTotal = (signed: any) => {
+    let total = 0n;
     const outs = signed.outputs();
-    let devTotal = 0n;
     const devTree = ErgoAddress.fromPublicKey(DEV_PK).ergoTree;
     for (let i = 0; i < outs.len(); i++) {
       const o = outs.get(i);
-      if (o.ergo_tree().to_base16_bytes() === devTree) devTotal += BigInt(o.value().as_i64().to_str());
+      if (o.ergo_tree().to_base16_bytes() === devTree) total += BigInt(o.value().as_i64().to_str());
     }
-    expect(devTotal).toBe(POT / 100n);                                  // one fee, not two
-    expect(changeTo(signed, p1Addr.ergoTree)).toBeGreaterThan(POT - 30000000n);
+    return total;
+  };
+
+  it('G1 REGRESSION: settling two 2 ERG matches against a single 0.02 ERG dev fee is now rejected', () => {
+    const { tx, inputs } = batch(POT / 100n);
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('G1b CONTROL: a single settlement paying one dev fee signs', () => {
+    const { tx, inputs } = single(POT / 100n);
+    const signed = reduceAndSign(tx, inputs, p1Secret, H);
+    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe((POT - POT / 100n).toString());
+    expect(devTotal(signed)).toBe(POT / 100n);                 // exactly one pot's fee, for one pot
+    expect(changeTo(signed, p1Addr.ergoTree)).toBeLessThan(20000000n);
   });
 
   it('G2 CONTROL: a dev output one nanoErg below devFeeNano is rejected', () => {
-    const { tx, inputs } = settleTx(POT / 100n - 1n);
+    const { tx, inputs } = batch(POT / 100n - 1n);
     expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
   });
 });
