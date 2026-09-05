@@ -52,13 +52,13 @@ Game (`contracts/sigmafleet.es:69`, `:209`): two game boxes with identical R4, R
 
 Reachability is the only thing between this and CRITICAL. The precondition is host-side duplication of a commitment. The client makes that plausible: `merkle.ts` persists `masterSeedHex` under `ergo_battleships_last_placed`, `generateBoardCommitment(grid, seed)` is deterministic, and `buildCreateLobbyTx` accepts whatever root and hash it is given, so any "list another game with the same board" flow reproduces R5 byte for byte. Cloning someone else's lobby does not work as a precondition, because the clone's refund branch is `proveDlog(victim)`.
 
-Fix, in every branch of both contracts:
+Fix, in all three game actions and in the lobby accept branch (not the lobby cancel branch, which is the host's own money and should stay batchable):
 
 ```ergoscript
 val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
 ```
 
-and in the lobby additionally `OUTPUTS.forall({ (b: Box) => b.propositionBytes != SELF.propositionBytes })`. This also closes finding 7. Off-chain, refuse to create a lobby whose R5 matches a commitment already on chain for that key.
+The red team verified this against every shipped builder: each spends exactly one contract box, so nothing regresses. `SELF.id == INPUTS(0).id` is cheaper but pins the box to input index 0, which the Fleet SDK coin selector does not guarantee. The structurally stronger fix is a per-match nonce (a singleton minted in the lobby, or the spent lobby's box id written into the freed R8 once finding 5 is fixed), which makes two register-identical boxes impossible rather than merely un-mergeable. This also closes finding 7. Off-chain, refuse to create a lobby whose R5 matches a commitment already on chain for that key.
 
 ### 2. Timeout sweep by phase, not score (HIGH at 30 blocks)
 
@@ -70,13 +70,15 @@ Two things make this more than a plain forfeit rule. The loser's forced concede 
 
 The EKB verifier's structural claims are confirmed and worth keeping: a player with claim rights always holds the running clock at the moment they gain them, there is no state in which they are denied a window, and Action 1's lack of a HEIGHT guard is the winner's only post-expiry recourse rather than an aggravating factor. Pass 1's "loser can fee-race the winner" framing was inverted and is withdrawn.
 
-Fix. The simplest version, which the red team verified handles the coverage case correctly because `honestScore` already blocks the sweep when the active player covered the board against a lying opponent:
+Fix. Deny the sweep while the timed-out player is the recorded winner, with a grace window so a winner who genuinely vanishes still forfeits one window later:
 
 ```ergoscript
-val timeoutValid = (HEIGHT > timeoutHeight) && (opponentRecordedHits < 10)
+val loserAlreadyWon = opponentRecordedHits >= 10
+val graceOver       = HEIGHT > timeoutHeight + timeoutBlocks
+val timeoutValid    = (HEIGHT > timeoutHeight) && (!loserAlreadyWon || graceOver)
 ```
 
-A winner who has 10 hits can always settle through Action 1, which has no deadline, so this cannot strand funds unless the winner's own board commitment is invalid. If that self-inflicted case matters, use a grace window instead: `(HEIGHT > timeoutHeight) && (opponentRecordedHits < 10 || HEIGHT > timeoutHeight + timeoutBlocks)`.
+The red team proved the coverage case needs no extra limb: when the active player covered the board against a lying opponent, `honestScore` already blocks the opponent's sweep. This form only delays the loser's free option, from about 20 blocks to about 40 at the shipped constant. The complete fix is to pay the timeout to the score leader when one exists (`if (p1Hits >= 10) p1Prop else if (p2Hits >= 10) p2Prop else <by phase>`, selecting `winnerBoardHash`, `opponentHistory`, and `opponentRecordedHits` the same way).
 
 ### 3. Stale-lobby accept and sweep (HIGH at 30 blocks)
 
@@ -84,17 +86,22 @@ A winner who has 10 hits can always settle through Action 1, which has no deadli
 
 The host is never notified that a match started. For turns two onward a player knows a move is due because someone just moved; for turn one the trigger is a stranger's transaction at a moment of their choosing. At 720 blocks this is a design trade-off. At 30 it is a free option against any host who opened a lobby and stepped away for an hour.
 
-Fix: give the opening move its own grace period in the lobby, decoupled from the per-turn window. The game contract only checks `nextTimeouts(1) == timeoutBlocks` afterwards, so a larger opening deadline disturbs nothing:
+Fix. The cleanest primary fix is a lobby time-to-live on the accept branch, which removes the stale-offer snipe at its source without holding the challenger's stake hostage:
+
+```ergoscript
+val LOBBY_TTL = 720
+val notExpired = HEIGHT <= SELF.creationInfo._1 + LOBBY_TTL
+```
+
+A first-turn grace is a useful second layer, but it must be a floor rather than a replacement, or it shortens the opening window for 720-block lobbies from about 710 blocks to 360. The game contract only checks `nextTimeouts(1) == timeoutBlocks` afterwards, so a larger opening deadline disturbs nothing:
 
 ```ergoscript
 val FIRST_TURN_GRACE = 360
-val validTimeouts = (timeoutBlocks >= 30) && (timeoutBlocks <= 720) && (outTimeouts.size == 2) &&
-                    (outTimeouts(1) == timeoutBlocks) &&
-                    (outTimeouts(0) >= HEIGHT + FIRST_TURN_GRACE) &&
-                    (outTimeouts(0) <= HEIGHT + FIRST_TURN_GRACE + 4)
+val opening = if (timeoutBlocks > FIRST_TURN_GRACE) timeoutBlocks else FIRST_TURN_GRACE
+... (outTimeouts(0) >= HEIGHT + opening) && (outTimeouts(0) <= HEIGHT + opening + 14)
 ```
 
-Also consider a lobby expiry height so a host can retire an unattended offer, and reconcile finding 13.
+Neither touches the per-turn exposure at 30 blocks. Raise the lobby's `timeoutBlocks` floor and reconcile finding 13.
 
 ### 4. Play root not bound to the board hash (MEDIUM)
 
@@ -110,15 +117,17 @@ On expected value the two passes disagreed and the red team's simulation is the 
 
 One more consequence neither pass caught at first: when the gate closes, the cheater is locked out of both Action 1 and Action 2, since `honestScore` is identical at `:316` and `:368`. If the honest opponent walks away instead of grinding 13 turns of coverage, the box is unspendable forever.
 
-Fix, the author's own, now recommended rather than deferred. Extend the payload to 134 bytes with the play root appended after the salt and check it at settlement:
+Fix, the author's own, now recommended rather than deferred. Extend the payload to 134 bytes with the play root appended after the salt and check it at settlement, in **both** Action 1 and Action 2. Action 2 has its own hash check, and a binding that lands only in Action 1 still lets the desynced cheater collect by timeout:
 
 ```ergoscript
-val committedRoot = rawPayload.slice(102, 134)
-val rootBound     = committedRoot == (if (isP1Claiming) p1Root else p2Root)
-// and (rawPayload.size == 134) in validBoardFormat
+// shared block: (rawPayload.size == 134) in validBoardFormat
+// Action 1:
+val rootBound = rawPayload.slice(102, 134) == (if (isP1Claiming) p1Root else p2Root)
+// Action 2:
+val rootBound = rawPayload.slice(102, 134) == (if (phase == 0) p2Root else p1Root)
 ```
 
-Appending after the salt keeps bytes 0-101 unchanged, so `buildBoardAuditPayload` and `extractShipGeometry` need no changes beyond the size. This is a commitment-format change and needs a redeploy and a client update. Until then, correct the README's "only ever loses money" wording.
+Appending after the salt keeps bytes 0-101 unchanged, so `extractShipGeometry` is unaffected. `buildBoardAuditPayload` must change: its pass-through branch allocates 102 bytes and copies indices 64 to 101, so a 134-byte committed payload is silently truncated and the digest no longer matches R5. This is a commitment-format change and needs a redeploy and a client update. Until then, correct the README's "only ever loses money" wording.
 
 ### 5. Escrow destination is host-written data (MEDIUM)
 
@@ -145,7 +154,7 @@ Both settlement branches (`:333-340`, `:370-371`) only require some output at in
 
 ### 8 to 12. Low findings
 
-- **8, no emergency refund.** A box is unspendable only if both players fail `validHash && honestScore` and Action 0 is exhausted. No honest player can be caught in it alone, but a two-signature refund gated far past the timeout (for example `HEIGHT > timeoutHeight + 4 * timeoutBlocks`) costs nothing and recovers the pair's funds.
+- **8, no emergency refund.** A box is unspendable only if both players fail `validHash && honestScore` and Action 0 is exhausted. No honest player can be caught in it alone. A two-signature refund branch is safe but only helps when both parties are present, which is not the common stranding case. A unilateral branch that pays the tie split after a long absolute grace (about 1440 blocks, never `4 * timeoutBlocks`, which a locked-out loser would happily wait out) does recover from a vanished counterparty.
 - **9, no shape re-validation.** The game trusts the lobby for `roots.size == 4`, 64-byte histories, and `30 <= timeoutBlocks <= 720`. `p1History.forall(...)` on an empty history is vacuously true, and the red team showed a box with an empty `R8(0)` pays the whole pot to P1 on move zero. Unreachable through the shipped lobby, but one `validParams` conjunct at the top of the script removes the dependency.
 - **10, unconstrained creation height.** The lobby never constrains `OUTPUTS(0).creationHeight`. A game box born 4 years old is storage-rent-expired and goes to a miner, not to either player. EIP-39's monotonic creation height rule is listed as implemented and would block backdating below the lobby input, so this stays LOW; a `creationHeight >= HEIGHT - 10` check is cheap defence in depth.
 - **11, identity point.** 33 zero bytes deserialize as a GroupElement, and `proveDlog(identity)` is satisfiable by anyone. A lobby or game keyed to it is spendable by strangers, including on the lobby refund branch. Self-harm only, but rejecting the identity point in R4 is one comparison.
@@ -174,12 +183,12 @@ Attacked and rejected, with the line that stopped each (details in `tests/adv_pr
 
 ## Recommended patch set, in order
 
-1. `singleInput` guard in every branch of both contracts, plus `noLobbyRecreated` in the lobby. Closes 1 and 7.
-2. `opponentRecordedHits < 10` (or the grace variant) in Action 2. Closes 2.
-3. One-sided timeout window in both contracts and a first-turn grace in the lobby. Closes 3 and 6.
-4. Hard-code the game tree hash in the lobby. Closes 5.
-5. Bind the play root into the 134-byte payload. Closes 4. Needs a redeploy and client change.
-6. `validParams` shape assertion, identity-point rejection, creation-height bound, two-signature emergency refund. Closes 8 to 11.
+1. `singleInput` guard in the three game actions and the lobby accept branch. Closes 1 and 7.
+2. Deny-and-grace timeout guard in Action 2, or pay the timeout to the score leader. Closes 2.
+3. One-sided timeout window in both contracts in the same deployment, a lobby time-to-live, and a first-turn grace floor. Closes 3 and 6.
+4. Hard-code the game tree hash in the lobby. Closes 5. Changes the lobby address.
+5. Bind the play root into the 134-byte payload in both settlement actions. Closes 4. Needs a redeploy and client change.
+6. `validParams` shape assertion, identity-point rejection, creation-height bound, a long-grace tie-split refund. Closes 8 to 11.
 7. Off-chain: make the CSPRNG fallback throw, refuse commitment reuse, verify R8 and the dev key before showing a lobby, fix the timeout contradiction, convert the reduce-only tests to reduce-and-sign, restore or drop `src/contracts/`.
 
 Items 1 to 4 are one line each and do not change any commitment format. With 1 to 3 applied the EKB verifier estimated the game contract at 8.5 / 10.
