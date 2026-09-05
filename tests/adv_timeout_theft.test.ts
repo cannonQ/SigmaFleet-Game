@@ -1,5 +1,7 @@
 /**
- * Adversarial PoCs around the timeout machinery of the Sigma Fleet contracts.
+ * Adversarial PoCs around the timeout machinery of the Sigma Fleet contracts, re-pointed at the
+ * hardened contracts. Every attack below is now a REGRESSION test: it must be rejected. Each one
+ * is paired with a liveness control proving the honest path it protects is still spendable.
  *
  * Harness: reduce + sign. `ReducedTransaction.from_unsigned_tx` alone does NOT fail on a
  * script that reduces to false; only `sign_reduced_transaction` throws
@@ -10,17 +12,27 @@
  * flips exactly at timeoutHeight == HEIGHT - 1 / HEIGHT. The harness is therefore exact to
  * the block.
  *
- * A1  ACTION 2 pays by phase, never by score: the player who has been beaten 10-0 sweeps
- *     the entire pot one block after the winner's turn clock lapses.
+ * A1  FIXED. ACTION 2 is now score-aware: `activeAlreadyWon = opponentRecordedHits >= 10`, and
+ *     while that holds the sweep needs `graceOver = HEIGHT > timeoutHeight + timeoutBlocks`.
+ *     The 0-10 loser can no longer sweep one block after the winner's clock lapses.
+ * A1b LIVENESS: a winner who genuinely vanishes still forfeits, one full window later.
+ * A1c LIVENESS: the ordinary forfeit (timed-out player holds fewer than 10 hits) is untouched
+ *     and still lands one block after the clock.
  * A2  Control for A1 at HEIGHT == timeoutHeight (must be rejected).
- * A3  The winner's honest ACTION 1 claim on the very same box also signs -> a pure race,
- *     and ACTION 1 carries no timeout guard at all so both remain valid forever.
- * B1  Lobby accept may set the game clock to the FLOOR of the legal window,
- *     HEIGHT + timeoutBlocks - 10 == HEIGHT + 20, not the nominal HEIGHT + 30.
- * B2  Control for B1 one block below the floor (must be rejected).
- * B3  ...after which the accepting attacker sweeps 99% of the pot from a host who never
- *     had a chance to move: the post-accept state has both histories zeroed, so
- *     honestScore is 0 == 0 and no game play is required at all.
+ * A3  The winner's honest ACTION 1 claim on the very same box still signs.
+ * B1  FIXED. Lobby accept can no longer set the game clock to HEIGHT + timeoutBlocks - 10.
+ *     The opening window is now max(tb, 360) with a one-sided 14-block band.
+ * B1b/B1c The new floor: HEIGHT + 360 signs, HEIGHT + 359 is rejected.
+ * B2  Control: the old sub-floor value is still rejected.
+ * B3  FIXED. The accept-then-sweep snipe now costs the challenger 360 blocks of waiting: the
+ *     sweep at H + 21 is rejected, and only clock + 1 (H + 361) lands — and only because the
+ *     host (P1, 0 hits) is the timed-out player, so no grace window applies.
+ * B4  Control for B3 at HEIGHT == timeoutHeight (must be rejected).
+ * C1  FIXED. Rule 7 is now one-sided: nextTimeoutHeight must be in
+ *     [HEIGHT + tb, HEIGHT + tb + 14], so the conceding loser can no longer shorten the
+ *     winner's clock to the floor.
+ * C1b/C1c The new band: HEIGHT + 30 (nominal) and HEIGHT + 44 (top) sign, HEIGHT + 45 does not.
+ * C2  Control: a clock below the band is rejected.
  */
 import { describe, it, expect } from 'vitest';
 import * as wasm from 'ergo-lib-wasm-nodejs';
@@ -39,6 +51,8 @@ const DEV_PK = DEFAULT_DEV_PK;
 const WAGER = 1000000000n; // 1 ERG each
 const POT = WAGER * 2n;
 const TB = 30; // timeout blocks, the client default (DEV_CONFIG.TIMEOUT_BLOCKS)
+const OPENING = 360; // lobby FIRST_TURN_GRACE: opening = max(TB, 360)
+const SLACK = 14; // one-sided mempool band on every deadline
 const FEE = 1100000n;
 
 // ---------------------------------------------------------------- harness
@@ -115,7 +129,7 @@ function gameBox(o: {
 }
 
 // ================================================================= A. loser sweeps
-describe('A. ACTION 2 decides by phase, not by score', () => {
+describe('A. ACTION 2 decides by score as well as phase', () => {
   const H = 1250000;
   // P2 has sunk every one of P1's ten ship cells (p2Hits == 10) -> P2 has won.
   // P1 has scored nothing (p1Hits == 0); the five cells still pending in R7 are all water.
@@ -130,18 +144,50 @@ describe('A. ACTION 2 decides by phase, not by score', () => {
     height: H - 50,
   };
 
-  it('A1 EXPLOIT: the 0-10 loser sweeps 99% of the pot one block after the winner clock lapses', () => {
-    const gb = gameBox({ ...st, timeoutHeight: H - 1 }); // HEIGHT > timeoutHeight
+  it('A1 REGRESSION: the 0-10 loser sweep one block after the winner clock lapses is rejected', () => {
+    const gb = gameBox({ ...st, timeoutHeight: H - 1 }); // HEIGHT > timeoutHeight, but grace still running
     const u = utxo(p1Addr.encode(), 20000000n, H - 50);
-    // Winner selection in ACTION 2 is `if (phase == 0) p2Prop else p1Prop` -> phase 1 pays P1.
+    // Winner selection in ACTION 2 is `if (phase == 0) p2Prop else p1Prop` -> phase 1 would pay P1,
+    // but activeAlreadyWon (p2Hits == 10) now holds the sweep back for one more full window.
+    const tx = buildClaimTimeoutTx({
+      claimerAddress: p1Addr.encode(), gameBox: gb, rawBoard: com1.saltedBoardPayload,
+      currentHeight: H, userUtxos: [u as any], isP1Claiming: true,
+    });
+    expect(() => reduceAndSign(tx, [gb, u], p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('A1b LIVENESS: the same sweep succeeds once HEIGHT > timeoutHeight + timeoutBlocks (grace over)', () => {
+    const clock = H - 1;
+    const sweepAt = clock + TB + 1;   // first block strictly past timeoutHeight + timeoutBlocks
+    const gb = gameBox({ ...st, timeoutHeight: clock });
+    const u = utxo(p1Addr.encode(), 20000000n, H - 50);
+    const tx = buildClaimTimeoutTx({
+      claimerAddress: p1Addr.encode(), gameBox: gb, rawBoard: com1.saltedBoardPayload,
+      currentHeight: sweepAt, userUtxos: [u as any], isP1Claiming: true,
+    });
+    const signed = reduceAndSign(tx, [gb, u], p1Secret, sweepAt);
+    const out0 = JSON.parse(signed.outputs().get(0).to_json());
+    expect(out0.ergoTree).toBe(p1Addr.ergoTree);                       // a vanished winner still forfeits
+    expect(BigInt(out0.value)).toBeGreaterThanOrEqual(POT - POT / 100n);
+  });
+
+  it('A1c LIVENESS: a sweep against a timed-out player with fewer than 10 hits still lands one block after the clock', () => {
+    // P2 is to move and has only 3 recorded hits, so activeAlreadyWon is false and no grace applies.
+    const p2Fired3 = [0, 1, 2, 48, 49];                    // 3 of P1's ship cells + 2 water
+    const gb = gameBox({
+      phase: 1, p1Hits: 0, p2Hits: 3, pending: [],
+      p1History: hist(p1Fired), p2History: hist(p2Fired3),
+      timeoutHeight: H - 1, height: H - 50,
+    });
+    const u = utxo(p1Addr.encode(), 20000000n, H - 50);
     const tx = buildClaimTimeoutTx({
       claimerAddress: p1Addr.encode(), gameBox: gb, rawBoard: com1.saltedBoardPayload,
       currentHeight: H, userUtxos: [u as any], isP1Claiming: true,
     });
     const signed = reduceAndSign(tx, [gb, u], p1Secret, H);
     const out0 = JSON.parse(signed.outputs().get(0).to_json());
-    expect(out0.ergoTree).toBe(p1Addr.ergoTree);                       // paid to the LOSER
-    expect(BigInt(out0.value)).toBeGreaterThanOrEqual(POT - POT / 100n); // 1.98 ERG of a 2 ERG pot
+    expect(out0.ergoTree).toBe(p1Addr.ergoTree);
+    expect(BigInt(out0.value)).toBeGreaterThanOrEqual(POT - POT / 100n);
   });
 
   it('A2 CONTROL: the identical sweep at HEIGHT == timeoutHeight is rejected', () => {
@@ -154,7 +200,7 @@ describe('A. ACTION 2 decides by phase, not by score', () => {
     expect(() => reduceAndSign(tx, [gb, u], p1Secret, H)).toThrow(/reduced to false/i);
   });
 
-  it('A3 RACE: the winner ACTION 1 claim on the same box is also valid, and has no clock at all', () => {
+  it('A3 LIVENESS: the winner ACTION 1 claim on the same box is still valid', () => {
     const gb = gameBox({ ...st, timeoutHeight: H - 1 });
     const u = utxo(p2Addr.encode(), 20000000n, H - 50);
     const tx = buildClaimWinTx({
@@ -169,12 +215,13 @@ describe('A. ACTION 2 decides by phase, not by score', () => {
 });
 
 // ================================================================= B. accept snipe
-describe('B. lobby accept lets the challenger pick the floor of the clock, then sweep', () => {
+describe('B. lobby accept must grant the host the full opening window', () => {
   const H = 1250000;
 
   function lobbyBox(value: bigint) {
     return withId({
-      value: value.toString(), ergoTree: getLobbyErgoTree().toHex(), assets: [], creationHeight: H - 5000,
+      // Inside the 720-block LOBBY_TTL, otherwise `notExpired` alone would reject every accept.
+      value: value.toString(), ergoTree: getLobbyErgoTree().toHex(), assets: [], creationHeight: H - 100,
       additionalRegisters: {
         R4: SColl(SGroupElement, [hexToBytes(p1Pk), hexToBytes(DEV_PK)]).toHex(),
         R5: SColl(SColl(SByte), [
@@ -212,26 +259,54 @@ describe('B. lobby accept lets the challenger pick the floor of the clock, then 
     return { tx, inputs: [lb, fund] };
   }
 
-  it('B1 EXPLOIT: accept with the clock at the FLOOR, HEIGHT + 20 rather than the nominal HEIGHT + 30', () => {
+  it('B1 REGRESSION: accept with the clock at the old floor, HEIGHT + 20, is rejected', () => {
     const { tx, inputs } = acceptTx(H + TB - 10);
+    expect(() => reduceAndSign(tx, inputs, p2Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('B1b LIVENESS: accept with the clock at HEIGHT + 360 (the new floor for tb = 30) signs', () => {
+    const { tx, inputs } = acceptTx(H + OPENING);
     const signed = reduceAndSign(tx, inputs, p2Secret, H);
     expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
   });
 
-  it('B2 CONTROL: one block below the floor (HEIGHT + 19) is rejected', () => {
+  it('B1c CONTROL: one block below the new floor (HEIGHT + 359) is rejected', () => {
+    const { tx, inputs } = acceptTx(H + OPENING - 1);
+    expect(() => reduceAndSign(tx, inputs, p2Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('B1d LIVENESS: the top of the band (HEIGHT + 374) signs and one above it is rejected', () => {
+    const top = acceptTx(H + OPENING + SLACK);
+    const signed = reduceAndSign(top.tx, top.inputs, p2Secret, H);
+    expect(signed.outputs().get(0).value().as_i64().to_str()).toBe(POT.toString());
+    const over = acceptTx(H + OPENING + SLACK + 1);
+    expect(() => reduceAndSign(over.tx, over.inputs, p2Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('B2 CONTROL: one block below the old floor (HEIGHT + 19) is rejected', () => {
     const { tx, inputs } = acceptTx(H + TB - 11);
     expect(() => reduceAndSign(tx, inputs, p2Secret, H)).toThrow(/reduced to false/i);
   });
 
-  it('B3 EXPLOIT: 21 blocks after acceptance the challenger sweeps the pot; the host never moved', () => {
-    const clock = H + TB - 10;         // set in B1
-    const sweepAt = clock + 1;         // first block where HEIGHT > timeoutHeight
+  it('B3 REGRESSION: the accept-then-sweep snipe now costs 360 blocks — the sweep at H + 21 is rejected, only clock + 1 lands', () => {
+    const clock = H + OPENING;         // the earliest deadline a legal accept can write (B1b)
     // The post-accept state verbatim: phase 0, no hits, no salvo, both histories all zero.
     const gb = gameBox({
       phase: 0, p1Hits: 0, p2Hits: 0, pending: [],
       p1History: hist([]), p2History: hist([]), timeoutHeight: clock, height: H,
     });
     const u = utxo(p2Addr.encode(), 20000000n, H, 'ff');
+
+    // The old snipe height: 21 blocks after acceptance the host's clock is still running.
+    const early = buildClaimTimeoutTx({
+      claimerAddress: p2Addr.encode(), gameBox: gb, rawBoard: com2.saltedBoardPayload,
+      currentHeight: H + 21, userUtxos: [u as any], isP1Claiming: false,
+    });
+    expect(() => reduceAndSign(early, [gb, u], p2Secret, H + 21)).toThrow(/reduced to false/i);
+
+    // At clock + 1 the sweep does land, and only because the timed-out host (P1) has 0 hits,
+    // so activeAlreadyWon is false and no extra grace window is owed.
+    const sweepAt = clock + 1;
     const tx = buildClaimTimeoutTx({
       claimerAddress: p2Addr.encode(), gameBox: gb, rawBoard: com2.saltedBoardPayload,
       currentHeight: sweepAt, userUtxos: [u as any], isP1Claiming: false,
@@ -244,7 +319,7 @@ describe('B. lobby accept lets the challenger pick the floor of the clock, then 
   });
 
   it('B4 CONTROL: the same sweep one block earlier (HEIGHT == timeoutHeight) is rejected', () => {
-    const clock = H + TB - 10;
+    const clock = H + OPENING;
     const gb = gameBox({
       phase: 0, p1Hits: 0, p2Hits: 0, pending: [],
       p1History: hist([]), p2History: hist([]), timeoutHeight: clock, height: H,
@@ -262,11 +337,11 @@ describe('B. lobby accept lets the challenger pick the floor of the clock, then 
 /**
  * The compounded form of A: the LOSING player is the one who computes the salvo that puts the
  * winner on ten hits, and the very same ACTION 0 transaction sets the winner's deadline. Rule 7
- * lets the mover choose anything in [HEIGHT + tb - 10, HEIGHT + tb + 4], so the loser hands the
- * winner the shortest legal window (20 blocks with the client default tb = 30) and then waits
- * with the A1 sweep ready. Cost of the option: one miner fee.
+ * used to accept anything in [HEIGHT + tb - 10, HEIGHT + tb + 4], so the loser could hand the
+ * winner the shortest legal window and wait with the A1 sweep ready. The band is now one-sided:
+ * [HEIGHT + tb, HEIGHT + tb + 14], so the deadline can only ever be later than nominal.
  */
-describe('C. the conceding loser sets the winner clock to the floor', () => {
+describe('C. Rule 7 is one-sided: the conceding loser cannot shorten the winner clock', () => {
   const H = 1250000;
   const pending = [16, 17, 18, 50, 51];                                   // 3 ship cells + 2 water
   const p2Fired = [0, 1, 2, 3, 4, 32, 33, ...pending];                     // 7 recorded + 3 new = 10
@@ -298,14 +373,28 @@ describe('C. the conceding loser sets the winner clock to the floor', () => {
     return { tx, inputs: [gb, u] };
   }
 
-  it('C1 EXPLOIT: the concede turn is accepted with the winner clock at HEIGHT + 20', () => {
+  it('C1 REGRESSION: the concede turn with the winner clock at HEIGHT + 20 is rejected', () => {
     const { tx, inputs } = concedeTx(H + TB - 10);
+    expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('C1b LIVENESS: the concede turn with the clock at HEIGHT + 30 (nominal) signs', () => {
+    const { tx, inputs } = concedeTx(H + TB);
     const signed = reduceAndSign(tx, inputs, p1Secret, H);
     const out0 = JSON.parse(signed.outputs().get(0).to_json());
     expect(out0.ergoTree).toBe(getBattleshipsErgoTree().toHex());
   });
 
-  it('C2 CONTROL: the same concede turn with a clock one block shorter is rejected', () => {
+  it('C1c BAND: HEIGHT + 44 signs, HEIGHT + 45 is rejected', () => {
+    const top = concedeTx(H + TB + SLACK);
+    const signed = reduceAndSign(top.tx, top.inputs, p1Secret, H);
+    expect(JSON.parse(signed.outputs().get(0).to_json()).ergoTree).toBe(getBattleshipsErgoTree().toHex());
+
+    const over = concedeTx(H + TB + SLACK + 1);
+    expect(() => reduceAndSign(over.tx, over.inputs, p1Secret, H)).toThrow(/reduced to false/i);
+  });
+
+  it('C2 CONTROL: the same concede turn with a clock one block below the old floor is rejected', () => {
     const { tx, inputs } = concedeTx(H + TB - 11);
     expect(() => reduceAndSign(tx, inputs, p1Secret, H)).toThrow(/reduced to false/i);
   });

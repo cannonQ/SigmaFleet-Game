@@ -9,11 +9,15 @@
  *       so p1CoveredBoard is vacuously true and P1 collects the entire pot having fired nothing.
  * R2-3  L-07 extended: proveDlog(identity) is spendable by anyone — shown on the LOBBY's own
  *       refund branch, which EKB did not test (they only showed the register deserialises).
- * R2-4  SF-02 fix comparison: the `activeCovered` limb of EKB's proposed guard is unreachable.
- *       Whenever the active player's claim rights come from coverage rather than 10 hits, the
- *       opponent's Action 2 sweep is ALREADY blocked by honestScore.
+ * R2-4  SF-02 fix as deployed. Two disjoint limbs, both exercised here:
+ *       (a) when the active player's claim rights come from coverage but the recorded score is a lie,
+ *           the opponent's Action 2 sweep is ALREADY blocked by honestScore;
+ *       (b) when the timed-out player is the honest recorded winner (>= 10 hits), the deployed
+ *           `activeAlreadyWon` guard holds the sweep back until HEIGHT > timeoutHeight + timeoutBlocks.
  * R2-5  SF-02 structural claim CONFIRMED: a player whose claim rights arrive on the wrong phase
  *       is blocked from Action 1 but is never denied a window — Action 2 pays them instead.
+ *       (The timed-out opponent there holds 0 recorded hits, so no grace window is owed and the
+ *       sweep still lands one block after the clock.)
  */
 import { describe, it, expect } from 'vitest';
 import * as wasm from 'ergo-lib-wasm-nodejs';
@@ -248,7 +252,7 @@ describe('R2-3 L-07: proveDlog(identity) is spendable by anyone, on the lobby re
 });
 
 // ---------------------------------------------------------------- R2-4  (SF-02 fix design)
-describe('R2-4 SF-02 fix: the `activeCovered` limb of EKB guard is unreachable', () => {
+describe('R2-4 SF-02 fix as deployed: honestScore covers the lying case, the score-aware grace covers the honest one', () => {
   function sweep(gb: any, sk: any, addr: string, payload: Uint8Array, height: number) {
     const u = utxo(addr, 20000000n, H - 60, 'e7');
     const tx = new TransactionBuilder(height)
@@ -272,13 +276,22 @@ describe('R2-4 SF-02 fix: the `activeCovered` limb of EKB guard is unreachable',
     expect(() => reduceAndSign(tx, inputs, p2Secret, H)).toThrow(/reduced to false/i);
   });
 
-  it('R2-4b: active player covered with p1Hits == 10 (opponent honest) — the sweep succeeds, and `opponentRecordedHits < 10` is exactly what stops it', () => {
+  it('R2-4b DEPLOYED GUARD: active player covered with p1Hits == 10 (the timed-out player IS the recorded winner) — the sweep is held for one full window and only lands after the grace expires', () => {
+    // phase 0 -> Action 2 pays P2, and opponentRecordedHits = p1Hits = 10, so the deployed guard sets
+    // activeAlreadyWon and requires graceOver = HEIGHT > timeoutHeight + timeoutBlocks on top of the clock.
     const gb = gameBox({
       phase: 0, p1Hits: 10, p2Hits: 3, pending: [],
       p1History: ALL_FIRED, p2History: hist([0, 1, 2]), timeoutHeight: H - 1, tag: 'e9',
     });
-    const { tx, inputs } = sweep(gb, p2Secret, p2Addr.encode(), com2.saltedBoardPayload, H);
-    const signed = reduceAndSign(tx, inputs, p2Secret, H);
+
+    // One block after the clock: HEIGHT > timeoutHeight holds, but the winner's extra window does not.
+    const early = sweep(gb, p2Secret, p2Addr.encode(), com2.saltedBoardPayload, H);
+    expect(() => reduceAndSign(early.tx, early.inputs, p2Secret, H)).toThrow(/reduced to false/i);
+
+    // One block after timeoutHeight + timeoutBlocks: a winner who genuinely vanished still forfeits.
+    const graceOverAt = (H - 1) + TB + 1;
+    const late = sweep(gb, p2Secret, p2Addr.encode(), com2.saltedBoardPayload, graceOverAt);
+    const signed = reduceAndSign(late.tx, late.inputs, p2Secret, graceOverAt);
     expect(JSON.parse(signed.outputs().get(0).to_json()).ergoTree).toBe(p2Addr.ergoTree);
   });
 });
@@ -302,6 +315,8 @@ describe('R2-5 SF-02 structural claim: claim rights on the wrong phase are never
     expect(() => reduceAndSign(tx, [gb, u], p1Secret, H)).toThrow(/reduced to false/i);
   });
 
+  // The timed-out player here is P2 with p2Hits == 0, so activeAlreadyWon is false under the
+  // hardened Action 2 and no extra grace window applies: the sweep still lands at timeoutHeight + 1.
   it('R2-5b: but P1 is not stranded — once P2 lets the clock run out, Action 2 pays P1', () => {
     const gb = gameBox({ ...st, timeoutHeight: H - 1, tag: 'ec' });
     const u = utxo(p1Addr.encode(), 20000000n, H - 60, 'ed');
