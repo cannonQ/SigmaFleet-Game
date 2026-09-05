@@ -58,6 +58,11 @@
   val winPayout  = totalPot - devFeeNano
   val tiePayout  = winPayout / 2
 
+  // Rule 0: Exactly one game box per transaction. Every rule below compares SELF against OUTPUTS(0),
+  // so without this guard N identical game boxes could be collapsed into one output (pot merging)
+  // and N settlements could share a single dev-fee output.
+  val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
+
   // --------------------------------------------------------------------------
   // 2. ACTION BRANCHES
   // --------------------------------------------------------------------------
@@ -201,8 +206,10 @@
                             (outHashes == roots) && 
                             (nextTimeouts(1) == timeoutBlocks)
 
-    // Rule 7: Mempool Timeout Window (allows up to 10 blocks of mempool delay, max +4)
-    val validTimeout = (nextTimeoutHeight >= HEIGHT + timeoutBlocks - 10) && (nextTimeoutHeight <= HEIGHT + timeoutBlocks + 4)
+    // Rule 7: One-Sided Timeout Window. The opponent's deadline may only be later than nominal, never earlier,
+    // so the mover cannot shorten the opponent's clock. The 14-block band is mempool tolerance: a turn built
+    // at height h choosing h + timeoutBlocks + 14 stays valid for inclusion heights h .. h + 14.
+    val validTimeout = (nextTimeoutHeight >= HEIGHT + timeoutBlocks) && (nextTimeoutHeight <= HEIGHT + timeoutBlocks + 14)
 
     // Rule 8: Value & Contract Preservation (Pure ERG Guard)
     val validTokens = (SELF.tokens.size == 0) && (outGame.tokens.size == 0)
@@ -214,7 +221,7 @@
     // Rule 10: Active Player Signature Required
     val signer = if (isP1Turn) p1Prop else p2Prop
 
-    sigmaProp(validPhase && validSalvoSize && validSalvoUnique && validHistories && validHits && validPreservation && validTimeout && validOutput && notTimedOut) && signer
+    sigmaProp(validPhase && validSalvoSize && validSalvoUnique && validHistories && validHits && validPreservation && validTimeout && validOutput && notTimedOut && singleInput) && signer
 
   // ==========================================================================
   // SETTLEMENT / TIMEOUT COMMON VALIDATION (102-BYTE BOARD AUDIT)
@@ -339,18 +346,24 @@
         (OUTPUTS(1).propositionBytes == devProp.propBytes) && (OUTPUTS(1).value >= devFeeNano)
       }
 
-      sigmaProp(validClaim && validBoardFormat && validHash && honestScore && validPayout) && claimerProp
+      sigmaProp(validClaim && validBoardFormat && validHash && honestScore && validPayout && singleInput) && claimerProp
 
     // ========================================================================
     // ACTION 2: CLAIM TIMEOUT / FORFEIT ESCROW SWEEP
     // ========================================================================
     } else if (action == 2.toByte) {
-      val timeoutValid = HEIGHT > timeoutHeight
-
       val winnerProp           = if (phase == 0) p2Prop else p1Prop
       val winnerBoardHash      = if (phase == 0) p2BoardHash else p1BoardHash
       val opponentHistory      = if (phase == 0) p1History else p2History
       val opponentRecordedHits = if (phase == 0) p1Hits else p2Hits
+
+      // Score-Aware Timeout: the timed-out (active) player is always the one who just gained claim rights,
+      // because a player may only settle on their own phase. If they are already the recorded winner they keep
+      // one extra window to settle through Action 1 before the non-active player may sweep. A winner who
+      // genuinely vanishes still forfeits, one window later.
+      val activeAlreadyWon = opponentRecordedHits >= 10
+      val graceOver        = HEIGHT > timeoutHeight + timeoutBlocks
+      val timeoutValid     = (HEIGHT > timeoutHeight) && (!activeAlreadyWon || graceOver)
 
       val validHash = blake2b256(rawPayload) == winnerBoardHash
 
@@ -370,7 +383,7 @@
       val validPayout = (OUTPUTS(0).propositionBytes == winnerProp.propBytes) && (OUTPUTS(0).value >= winPayout) &&
                         (OUTPUTS(1).propositionBytes == devProp.propBytes) && (OUTPUTS(1).value >= devFeeNano)
 
-      sigmaProp(timeoutValid && validBoardFormat && validHash && honestScore && validPayout) && winnerProp
+      sigmaProp(timeoutValid && validBoardFormat && validHash && honestScore && validPayout && singleInput) && winnerProp
 
     // ========================================================================
     // DEFAULT: UNKNOWN ACTION REJECTED

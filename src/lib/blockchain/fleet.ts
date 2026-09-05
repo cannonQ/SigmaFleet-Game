@@ -24,6 +24,12 @@ export const DEV_FEE_PERCENT = DEV_CONFIG.DEV_FEE_PERCENT;
 export const MINER_FEE_NANO_ERG = DEV_CONFIG.MINER_FEE_NANO_ERG;
 export const TIMEOUT_BLOCK_DELTA = DEV_CONFIG.TIMEOUT_BLOCKS;
 export const SALVO_SIZE = 5;
+// Contract timing constants. Keep in sync with LOBBY_SCRIPT / BATTLESHIPS_SCRIPT.
+export const TIMEOUT_SLACK_BLOCKS = 14; // width of the one-sided deadline window (mempool tolerance)
+export const FIRST_TURN_GRACE_BLOCKS = 360; // minimum opening-move window granted to the host by the lobby
+export const LOBBY_TTL_BLOCKS = 720; // a lobby older than this can no longer be accepted
+// blake2b256 of the compiled BATTLESHIPS_SCRIPT ErgoTree, hard-coded into LOBBY_SCRIPT (asserted by tests).
+export const BATTLESHIPS_TREE_HASH_HEX = '8e92acff548e5f242726819cf206973db4935f0ccb4930032d57623c5302722e';
 
 export const LOBBY_SCRIPT = `
 /**
@@ -39,7 +45,8 @@ export const LOBBY_SCRIPT = `
  * - R5: Coll[Coll[Byte]]     -> [0: Host 32B Salted Hash]
  * - R6: Coll[Int]            -> Empty collection []
  * - R7: Coll[Byte]           -> Empty collection []
- * - R8: Coll[Byte]           -> 32-byte Blake2b-256 hash of the compiled Battleships contract ErgoTree
+ * - R8: Coll[Byte]           -> 32-byte Blake2b-256 hash of the compiled Battleships contract ErgoTree (informational;
+ *                               the accept rule compares against the hard-coded BATTLESHIPS_HASH constant, not R8)
  * - R9: Int                  -> Turn Timeout Duration in Blocks (e.g. 30 blocks ≈ 60 mins)
  * 
  * CONTEXT VARIABLES:
@@ -66,9 +73,16 @@ export const LOBBY_SCRIPT = `
   } else {
     val lobbyPlayers = SELF.R4[Coll[GroupElement]].get
     val host         = lobbyPlayers(0)
-    val battleshipsScript = SELF.R8[Coll[Byte]].get
+
+    // Blake2b-256 of the compiled Battleships ErgoTree. Hard-coded so that a host cannot steer a challenger's
+    // stake into an arbitrary script by writing a different hash into R8.
+    val BATTLESHIPS_HASH = fromBase16("8e92acff548e5f242726819cf206973db4935f0ccb4930032d57623c5302722e")
 
     val outGame = OUTPUTS(0)
+
+    // Rule 0: Exactly one lobby box per accept transaction. Without this, N identical lobbies of the same host
+    // could be collapsed into one game box, letting the challenger enter without staking (or pocket the surplus).
+    val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
 
     // Rule 1: Player Roster Preservation [Host, Challenger, Dev] with Hardcoded Dev PK
     val outPlayers   = outGame.R4[Coll[GroupElement]].get
@@ -97,20 +111,30 @@ export const LOBBY_SCRIPT = `
                        histories(0).forall({ (b: Byte) => b == 0.toByte }) && 
                        histories(1).forall({ (b: Byte) => b == 0.toByte })
 
-    // Rule 6: Turn Timeout Parameters [Timeout Height, Timeout Blocks] with Minimum Floor (>= 30)
-    val timeoutBlocks = SELF.R9[Int].get
-    val outTimeouts   = outGame.R9[Coll[Int]].get
+    // Rule 6: Turn Timeout Parameters [Timeout Height, Timeout Blocks] with Minimum Floor (>= 30).
+    // The host's opening move gets a grace floor of FIRST_TURN_GRACE blocks, because the host is not notified
+    // when a stranger accepts. The window is one-sided: the deadline may only be later than nominal, so the
+    // challenger can never shorten the host's clock. The 14-block band is mempool tolerance.
+    val timeoutBlocks    = SELF.R9[Int].get
+    val outTimeouts      = outGame.R9[Coll[Int]].get
+    val FIRST_TURN_GRACE = 360
+    val opening          = if (timeoutBlocks > FIRST_TURN_GRACE) timeoutBlocks else FIRST_TURN_GRACE
     val validTimeouts = (timeoutBlocks >= 30) && (timeoutBlocks <= 720) &&
                         (outTimeouts.size == 2) && 
                         (outTimeouts(1) == timeoutBlocks) && 
-                        (outTimeouts(0) >= HEIGHT + timeoutBlocks - 10) && 
-                        (outTimeouts(0) <= HEIGHT + timeoutBlocks + 4)
+                        (outTimeouts(0) >= HEIGHT + opening) && 
+                        (outTimeouts(0) <= HEIGHT + opening + 14)
 
     // Rule 7: Matching Escrow Value & Pure ERG Guard (Tokens Strictly Disallowed)
     val validFunds    = (outGame.value == SELF.value * 2L) && (SELF.tokens.size == 0) && (outGame.tokens.size == 0)
 
-    // Rule 8: Battleships Contract Verification (Output script must match verified ErgoTree hash)
-    val validContract = blake2b256(outGame.propositionBytes) == battleshipsScript
+    // Rule 8: Battleships Contract Verification (Output script must match the hard-coded ErgoTree hash)
+    val validContract = blake2b256(outGame.propositionBytes) == BATTLESHIPS_HASH
+
+    // Rule 9: Lobby Expiry. A stale offer cannot be accepted; the host must re-list. This removes the
+    // "accept an idle host's lobby and sweep it" option at its source.
+    val LOBBY_TTL  = 720
+    val notExpired = HEIGHT <= SELF.creationInfo._1 + LOBBY_TTL
 
     // All match start rules must strictly pass
     val isAccept = validPlayers && 
@@ -120,7 +144,9 @@ export const LOBBY_SCRIPT = `
                    validTimeouts && 
                    validHistory && 
                    validFunds && 
-                   validContract
+                   validContract && 
+                   notExpired && 
+                   singleInput
 
     sigmaProp(isAccept)
   }
@@ -186,6 +212,11 @@ export const BATTLESHIPS_SCRIPT = `
   val devFeeNano = totalPot / 100
   val winPayout  = totalPot - devFeeNano
   val tiePayout  = winPayout / 2
+
+  // Rule 0: Exactly one game box per transaction. Every rule below compares SELF against OUTPUTS(0),
+  // so without this guard N identical game boxes could be collapsed into one output (pot merging)
+  // and N settlements could share a single dev-fee output.
+  val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
 
   // --------------------------------------------------------------------------
   // 2. ACTION BRANCHES
@@ -330,8 +361,10 @@ export const BATTLESHIPS_SCRIPT = `
                             (outHashes == roots) && 
                             (nextTimeouts(1) == timeoutBlocks)
 
-    // Rule 7: Mempool Timeout Window (allows up to 10 blocks of mempool delay, max +4)
-    val validTimeout = (nextTimeoutHeight >= HEIGHT + timeoutBlocks - 10) && (nextTimeoutHeight <= HEIGHT + timeoutBlocks + 4)
+    // Rule 7: One-Sided Timeout Window. The opponent's deadline may only be later than nominal, never earlier,
+    // so the mover cannot shorten the opponent's clock. The 14-block band is mempool tolerance: a turn built
+    // at height h choosing h + timeoutBlocks + 14 stays valid for inclusion heights h .. h + 14.
+    val validTimeout = (nextTimeoutHeight >= HEIGHT + timeoutBlocks) && (nextTimeoutHeight <= HEIGHT + timeoutBlocks + 14)
 
     // Rule 8: Value & Contract Preservation (Pure ERG Guard)
     val validTokens = (SELF.tokens.size == 0) && (outGame.tokens.size == 0)
@@ -343,7 +376,7 @@ export const BATTLESHIPS_SCRIPT = `
     // Rule 10: Active Player Signature Required
     val signer = if (isP1Turn) p1Prop else p2Prop
 
-    sigmaProp(validPhase && validSalvoSize && validSalvoUnique && validHistories && validHits && validPreservation && validTimeout && validOutput && notTimedOut) && signer
+    sigmaProp(validPhase && validSalvoSize && validSalvoUnique && validHistories && validHits && validPreservation && validTimeout && validOutput && notTimedOut && singleInput) && signer
 
   // ==========================================================================
   // SETTLEMENT / TIMEOUT COMMON VALIDATION (102-BYTE BOARD AUDIT)
@@ -468,18 +501,24 @@ export const BATTLESHIPS_SCRIPT = `
         (OUTPUTS(1).propositionBytes == devProp.propBytes) && (OUTPUTS(1).value >= devFeeNano)
       }
 
-      sigmaProp(validClaim && validBoardFormat && validHash && honestScore && validPayout) && claimerProp
+      sigmaProp(validClaim && validBoardFormat && validHash && honestScore && validPayout && singleInput) && claimerProp
 
     // ========================================================================
     // ACTION 2: CLAIM TIMEOUT / FORFEIT ESCROW SWEEP
     // ========================================================================
     } else if (action == 2.toByte) {
-      val timeoutValid = HEIGHT > timeoutHeight
-
       val winnerProp           = if (phase == 0) p2Prop else p1Prop
       val winnerBoardHash      = if (phase == 0) p2BoardHash else p1BoardHash
       val opponentHistory      = if (phase == 0) p1History else p2History
       val opponentRecordedHits = if (phase == 0) p1Hits else p2Hits
+
+      // Score-Aware Timeout: the timed-out (active) player is always the one who just gained claim rights,
+      // because a player may only settle on their own phase. If they are already the recorded winner they keep
+      // one extra window to settle through Action 1 before the non-active player may sweep. A winner who
+      // genuinely vanishes still forfeits, one window later.
+      val activeAlreadyWon = opponentRecordedHits >= 10
+      val graceOver        = HEIGHT > timeoutHeight + timeoutBlocks
+      val timeoutValid     = (HEIGHT > timeoutHeight) && (!activeAlreadyWon || graceOver)
 
       val validHash = blake2b256(rawPayload) == winnerBoardHash
 
@@ -499,7 +538,7 @@ export const BATTLESHIPS_SCRIPT = `
       val validPayout = (OUTPUTS(0).propositionBytes == winnerProp.propBytes) && (OUTPUTS(0).value >= winPayout) &&
                         (OUTPUTS(1).propositionBytes == devProp.propBytes) && (OUTPUTS(1).value >= devFeeNano)
 
-      sigmaProp(timeoutValid && validBoardFormat && validHash && honestScore && validPayout) && winnerProp
+      sigmaProp(timeoutValid && validBoardFormat && validHash && honestScore && validPayout && singleInput) && winnerProp
 
     // ========================================================================
     // DEFAULT: UNKNOWN ACTION REJECTED
@@ -853,6 +892,8 @@ export function buildAcceptLobbyTx(params: {
     }
   } catch (e) {}
 
+  const openingWindow = Math.max(timeoutDuration, FIRST_TURN_GRACE_BLOCKS);
+
   const lobbyValue = BigInt(params.lobbyBox.value);
   const totalPot = lobbyValue * 2n;
 
@@ -872,7 +913,10 @@ export function buildAcceptLobbyTx(params: {
       R6: SColl(SInt, [0, 0, 0]).toHex(),
       R7: SColl(SInt, []).toHex(), // Pure blind: opening salvo will be fired by Host on Turn 1
       R8: SColl(SColl(SByte), [initialP1History, initialP2History]).toHex(),
-      R9: SColl(SInt, [params.currentHeight + 1 + timeoutDuration, timeoutDuration]).toHex(),
+      // Opening deadline: the lobby grants the host max(timeoutDuration, FIRST_TURN_GRACE) blocks and accepts
+      // deadlines in [HEIGHT + opening, HEIGHT + opening + 14]; the top of the band is valid for inclusion
+      // heights currentHeight .. currentHeight + 14.
+      R9: SColl(SInt, [params.currentHeight + openingWindow + TIMEOUT_SLACK_BLOCKS, timeoutDuration]).toHex(),
     });
 
   const tx = new TransactionBuilder(params.currentHeight + 1)
@@ -1099,11 +1143,11 @@ export function buildPlayTurnTx(params: {
       R6: SColl(SInt, [nextPhase, newP1Hits, newP2Hits, params.sunkShipCode || 0]).toHex(),
       R7: SColl(SInt, sortedSalvo).toHex(),
       R8: SColl(SColl(SByte), [nextP1History, nextP2History]).toHex(),
-      // The contract accepts nextTimeoutHeight in [HEIGHT + tb - 10, HEIGHT + tb + 4].
-      // currentHeight + tb + 4 is the choice that stays valid for the widest range
+      // The contract accepts nextTimeoutHeight in [HEIGHT + tb, HEIGHT + tb + 14].
+      // currentHeight + tb + 14 is the choice that stays valid for the widest range
       // of inclusion heights (currentHeight .. currentHeight + 14), which buys the
       // most mempool delay before the turn has to be rebuilt.
-      R9: SColl(SInt, [params.currentHeight + timeoutBlocks + 4, timeoutBlocks]).toHex(),
+      R9: SColl(SInt, [params.currentHeight + timeoutBlocks + TIMEOUT_SLACK_BLOCKS, timeoutBlocks]).toHex(),
     });
 
   return new TransactionBuilder(params.currentHeight + 1)

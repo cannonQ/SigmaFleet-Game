@@ -92,7 +92,9 @@ vars `1`–`5`), then fires back. Enforced: alternating phase; exactly five shot
 final turn, since 64 = 12×5 + 4); strictly ascending coordinates, so a salvo cannot contain
 duplicates; append-only shot history with no cell fired twice; hit counts equal to what the
 proofs prove; players, commitments and timeout window unchanged; pot and script unchanged;
-and the turn clock not yet expired.
+the turn clock not yet expired; the opponent's new deadline no earlier than `HEIGHT +
+timeoutBlocks` (the mover can lengthen the opponent's clock by up to 14 blocks of mempool
+slack, never shorten it); and exactly one game box spent in the transaction.
 
 **`1` — Claim / settle.** Reveals the claimant's 102-byte board payload in context var `99`.
 Checked: it hashes to the commitment in `R5`; it is a legal fleet — three ships of the right
@@ -102,7 +104,10 @@ equal their true hits against the revealed board, allowing for a salvo still une
 `R7`. A draw is paid when the opponent also reached 10.
 
 **`2` — Claim timeout.** After `HEIGHT > timeoutHeight`, the player who is *not* the active
-one sweeps the pot. Note this is decided by phase, not by score.
+one sweeps the pot. If the active player is already the recorded winner (10 hits), the sweep
+is deferred by one further timeout window so they can settle through action `1`, which has
+no deadline; a winner who genuinely vanishes still forfeits one window later. Exactly one game
+box may be spent per transaction.
 
 Anything else is rejected.
 
@@ -146,13 +151,18 @@ of them.
 For reference, the current build produces:
 
 ```
-battleships ErgoTree   3383 bytes
-lobby      ErgoTree     473 bytes
-battleships tree hash   b146c39cfb9f603450be9521feeafe91587afc44db3a2aab1d16cf8f680df438
+battleships ErgoTree   3432 bytes
+lobby      ErgoTree     549 bytes
+battleships tree hash   8e92acff548e5f242726819cf206973db4935f0ccb4930032d57623c5302722e
 ```
 
-The lobby contract stores that tree hash in `R8` and refuses to open a match whose output
-script does not match it — so a lobby can only ever hand its escrow to this exact contract.
+The lobby contract carries that tree hash as a compile-time constant and refuses to open a
+match whose output script does not match it — so a lobby can only ever hand its escrow to
+this exact contract. (`R8` still records the hash for indexers, but the contract no longer
+reads it.) The lobby also enforces: exactly one lobby box per accept transaction; an offer
+older than 720 blocks can no longer be accepted; and the host's opening move gets at least
+360 blocks (or the lobby's own timeout, whichever is larger) before it can be timed out,
+since the host is not notified when a stranger accepts.
 
 ### The adversarial tests
 
@@ -170,20 +180,27 @@ the contract rejects it:
 
 ## Known issues
 
-Reviewed by the author, not by an outside auditor. Two things worth knowing before you read
-the code and find them yourself:
+A full review, with signed proof-of-concept transactions for every finding, is in
+`audit/CONTRACT_REVIEW.md`. The single-input guard, score-aware timeout, one-sided deadline
+windows, lobby expiry, first-turn grace and hard-coded game hash from that review are applied
+in the contracts above. Two things worth knowing before you read the code and find them
+yourself:
 
 **The play-time Merkle root is not bound to the settlement board hash.** `R5` carries two
 independent commitments per player — the root used during play, and the hash revealed at
 settlement — and nothing forces them to describe the same board. Someone can therefore commit
-an all-water root for play, so every shot against them reads as a miss.
+a root that disagrees with their real board.
 
-It is not exploitable for profit. To collect they must reveal a board matching their hash,
-and `honestScore` then rejects the claim, so they forfeit their stake and the honest player
-takes the pot by claim or by timeout. Because the attack only ever loses money, it is
-deliberately left open rather than risk rewriting working contract code. The fix, should the
-trade-off change, is to embed the root inside the hashed payload and compare it at
-settlement — O(1).
+It is not profitable in expectation, but it is not harmless. The strongest form is a
+one-cell lie: the root declares one real ship cell as water, so the opponent's recorded hits
+are capped at 9 and they can only win by covering all 64 cells. The cheater then settles with
+their real board and collects the whole pot whenever the opponent has not yet fired at the
+hidden cell in an answered salvo. Simulation puts that at roughly one match in seven against
+a hunt-and-target opponent and it cannot be detected during play; when it fails the cheater
+is locked out of both settlement paths and forfeits. See finding 4 of the review, and
+`tests/root_board_desync_exploit.test.ts`. The fix is to append the play root to the hashed
+payload and compare it in both settlement actions — O(1), but a commitment-format change that
+needs a redeploy and a client update, so it is not yet applied.
 
 **Fixed:** `cleanHex32` and `normalizeRootHex` used to strip serialisation prefixes
 unconditionally, so a raw 32-byte commitment that merely *began* with one of those byte

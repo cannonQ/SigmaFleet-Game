@@ -11,7 +11,8 @@
  * - R5: Coll[Coll[Byte]]     -> [0: Host 32B Salted Hash]
  * - R6: Coll[Int]            -> Empty collection []
  * - R7: Coll[Byte]           -> Empty collection []
- * - R8: Coll[Byte]           -> 32-byte Blake2b-256 hash of the compiled Battleships contract ErgoTree
+ * - R8: Coll[Byte]           -> 32-byte Blake2b-256 hash of the compiled Battleships contract ErgoTree (informational;
+ *                               the accept rule compares against the hard-coded BATTLESHIPS_HASH constant, not R8)
  * - R9: Int                  -> Turn Timeout Duration in Blocks (e.g. 30 blocks ≈ 60 mins)
  * 
  * CONTEXT VARIABLES:
@@ -38,9 +39,16 @@
   } else {
     val lobbyPlayers = SELF.R4[Coll[GroupElement]].get
     val host         = lobbyPlayers(0)
-    val battleshipsScript = SELF.R8[Coll[Byte]].get
+
+    // Blake2b-256 of the compiled Battleships ErgoTree. Hard-coded so that a host cannot steer a challenger's
+    // stake into an arbitrary script by writing a different hash into R8.
+    val BATTLESHIPS_HASH = fromBase16("8e92acff548e5f242726819cf206973db4935f0ccb4930032d57623c5302722e")
 
     val outGame = OUTPUTS(0)
+
+    // Rule 0: Exactly one lobby box per accept transaction. Without this, N identical lobbies of the same host
+    // could be collapsed into one game box, letting the challenger enter without staking (or pocket the surplus).
+    val singleInput = INPUTS.filter({ (b: Box) => b.propositionBytes == SELF.propositionBytes }).size == 1
 
     // Rule 1: Player Roster Preservation [Host, Challenger, Dev] with Hardcoded Dev PK
     val outPlayers   = outGame.R4[Coll[GroupElement]].get
@@ -69,20 +77,30 @@
                        histories(0).forall({ (b: Byte) => b == 0.toByte }) && 
                        histories(1).forall({ (b: Byte) => b == 0.toByte })
 
-    // Rule 6: Turn Timeout Parameters [Timeout Height, Timeout Blocks] with Minimum Floor (>= 30)
-    val timeoutBlocks = SELF.R9[Int].get
-    val outTimeouts   = outGame.R9[Coll[Int]].get
+    // Rule 6: Turn Timeout Parameters [Timeout Height, Timeout Blocks] with Minimum Floor (>= 30).
+    // The host's opening move gets a grace floor of FIRST_TURN_GRACE blocks, because the host is not notified
+    // when a stranger accepts. The window is one-sided: the deadline may only be later than nominal, so the
+    // challenger can never shorten the host's clock. The 14-block band is mempool tolerance.
+    val timeoutBlocks    = SELF.R9[Int].get
+    val outTimeouts      = outGame.R9[Coll[Int]].get
+    val FIRST_TURN_GRACE = 360
+    val opening          = if (timeoutBlocks > FIRST_TURN_GRACE) timeoutBlocks else FIRST_TURN_GRACE
     val validTimeouts = (timeoutBlocks >= 30) && (timeoutBlocks <= 720) &&
                         (outTimeouts.size == 2) && 
                         (outTimeouts(1) == timeoutBlocks) && 
-                        (outTimeouts(0) >= HEIGHT + timeoutBlocks - 10) && 
-                        (outTimeouts(0) <= HEIGHT + timeoutBlocks + 4)
+                        (outTimeouts(0) >= HEIGHT + opening) && 
+                        (outTimeouts(0) <= HEIGHT + opening + 14)
 
     // Rule 7: Matching Escrow Value & Pure ERG Guard (Tokens Strictly Disallowed)
     val validFunds    = (outGame.value == SELF.value * 2L) && (SELF.tokens.size == 0) && (outGame.tokens.size == 0)
 
-    // Rule 8: Battleships Contract Verification (Output script must match verified ErgoTree hash)
-    val validContract = blake2b256(outGame.propositionBytes) == battleshipsScript
+    // Rule 8: Battleships Contract Verification (Output script must match the hard-coded ErgoTree hash)
+    val validContract = blake2b256(outGame.propositionBytes) == BATTLESHIPS_HASH
+
+    // Rule 9: Lobby Expiry. A stale offer cannot be accepted; the host must re-list. This removes the
+    // "accept an idle host's lobby and sweep it" option at its source.
+    val LOBBY_TTL  = 720
+    val notExpired = HEIGHT <= SELF.creationInfo._1 + LOBBY_TTL
 
     // All match start rules must strictly pass
     val isAccept = validPlayers && 
@@ -92,7 +110,9 @@
                    validTimeouts && 
                    validHistory && 
                    validFunds && 
-                   validContract
+                   validContract && 
+                   notExpired && 
+                   singleInput
 
     sigmaProp(isAccept)
   }
